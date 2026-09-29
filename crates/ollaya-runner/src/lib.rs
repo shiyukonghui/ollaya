@@ -13,6 +13,7 @@ pub mod kev;
 pub mod llama;
 #[cfg(feature = "mlx")]
 pub mod mlx;
+pub mod neohorse;
 pub mod net;
 pub mod nli;
 pub mod onnx;

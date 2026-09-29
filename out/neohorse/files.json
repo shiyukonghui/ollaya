@@ -1,0 +1,31 @@
+{
+  "model": "neohorse",
+  "weightless": {
+    "vision": {
+      "cast": 297,
+      "external": 297,
+      "inline": 1,
+      "gather_before_cast": 1
+    },
+    "decoder": {
+      "cast": 426,
+      "external": 430,
+      "inline": 5,
+      "gather_before_cast": 1
+    }
+  },
+  "unused_checkpoint_tensors": {
+    "vision": {
+      "model-00001-of-00003.safetensors": 167,
+      "model-00002-of-00003.safetensors": 236,
+      "model-00003-of-00003.safetensors": 23,
+      "pointer_head.safetensors": 4
+    },
+    "decoder": {
+      "model-00001-of-00003.safetensors": 0,
+      "model-00002-of-00003.safetensors": 0,
+      "model-00003-of-00003.safetensors": 297,
+      "pointer_head.safetensors": 0
+    }
+  }
+}

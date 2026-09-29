@@ -1,0 +1,9 @@
+{
+  "temperature": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "temperature_by_options": {},
+  "source": "model_manifest.json temperature (1.0)"
+}

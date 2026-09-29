@@ -95,6 +95,7 @@ pub const LAYOUTS: &[&str] = &[
     "decision-endpoint-v1",
     "clm-v1",
     "decider-vision-v1",
+    "neohorse-pointer-vision-v1",
 ];
 
 /// The layout a `decision` layer declares.
@@ -144,6 +145,9 @@ pub fn load(
         "decider-vision-v1" => Ok(Box::new(
             crate::decider_vision::VisionDeciderModel::load_files(files, device, threads)?,
         )),
+        "neohorse-pointer-vision-v1" => Ok(Box::new(crate::neohorse::NeohorseModel::load_files(
+            files, device, threads,
+        )?)),
         other => Err(Error::Model(format!(
             "this version of ollaya cannot run layout {other:?} (supported: {}); upgrade ollaya",
             LAYOUTS.join(", ")

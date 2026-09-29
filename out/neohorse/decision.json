@@ -1,0 +1,88 @@
+{
+  "engine": "onnx",
+  "family": "neohorse",
+  "layout": "neohorse-pointer-vision-v1",
+  "upstream": {
+    "repo": "NeoHorse-Jev-4B",
+    "bundle": "D:\\jev-like\\models\\NeoHorse-Jev-4B",
+    "note": "merged Qwen3.5-4B multimodal backbone + independent pointer head"
+  },
+  "graphs": {
+    "vision": "vision.onnx",
+    "decoder": "model.onnx"
+  },
+  "max_state_tokens": 384,
+  "max_row_tokens": 1024,
+  "max_ctx_tokens": 12288,
+  "min_options": 1,
+  "max_options": 255,
+  "chunk": 64,
+  "special_tokens": {
+    "state": 248060,
+    "question": 248061,
+    "option_open": 248049,
+    "option_close": 248050,
+    "decide": 248062,
+    "vision_start": 248053,
+    "vision_end": 248054,
+    "image": 248056,
+    "pad": 248044,
+    "texts": [
+      "<|fim_prefix|>",
+      "<|fim_middle|>",
+      "<|box_start|>",
+      "<|box_end|>",
+      "<|fim_suffix|>"
+    ],
+    "add_special_tokens": false
+  },
+  "user_text_escape": {
+    "pattern": "<\\|([A-Za-z0-9_]+)\\|>",
+    "replace": "<¦$1¦>"
+  },
+  "templates": {
+    "row": "[fim_prefix] (vision prefix) user(render(state))[:max_state-1] [fim_middle] user(render(instructions)) ([box_start] user(option) [box_end])* [fim_suffix]",
+    "choice_option": "{name} | {name}: {render(description)}",
+    "noul_options": [
+      "no | no: {render(false)}",
+      "yes | yes: {render(true)}"
+    ],
+    "score_option": "{render(level)}",
+    "render": "neohorse_decision render: None->'', scalars->Python str(), list->'- item' lines, dict->'key: value' lines, 2-space nesting"
+  },
+  "image": {
+    "patch_size": 16,
+    "temporal_patch_size": 2,
+    "merge_size": 2,
+    "min_pixels": 65536,
+    "max_pixels": 1048576,
+    "resample": "PIL bicubic",
+    "rescale_factor": 0.00392156862745098,
+    "image_mean": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "image_std": [
+      0.5,
+      0.5,
+      0.5
+    ],
+    "position_table_side": 48,
+    "position_interpolation": "bilinear, align_corners",
+    "max_image_tokens": 1024
+  },
+  "mrope_section": [
+    11,
+    11,
+    10
+  ],
+  "option_logits": {
+    "choice": "scores[row, :k]",
+    "noul": "scores[row, :2] (0 = no = false, 1 = yes = true)",
+    "score": "scores[row, :levels]"
+  },
+  "opset": 20,
+  "precision": "fp32 compute; base weights BF16, widened by Cast; head F32",
+  "weights_in_memory": "bf16"
+}
