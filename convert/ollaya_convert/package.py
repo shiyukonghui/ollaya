@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 import urllib.request
 
 import onnx
@@ -49,10 +50,55 @@ MEDIA = {
     "gguf": "application/vnd.ollaya.weights.gguf",
 }
 HF = "https://huggingface.co"
+MS = "https://www.modelscope.cn"
+#: ModelScope exposes no per-commit date, so a ModelScope model's `release_date` is the model's own
+#: last-updated date. Cached per repo.
+_ms_files: dict = {}
+_ms_dates: dict = {}
 
 
 def sha256(b):
     return hashlib.sha256(b).hexdigest()
+
+
+def upstream_host(repo):
+    """`("modelscope", "ns/name")` for a `modelscope:`-prefixed repo, `("hf", repo)` otherwise.
+
+    Ollaya fetches weights from the author, wherever the author publishes them. ModelScope is a
+    second host with its own API and resolve URL; a catalog entry names it by prefix
+    (`modelscope:TokenRhythm/NeoHorse-Jev-4B`).
+    """
+    if repo.startswith("modelscope:"):
+        return "modelscope", repo.split(":", 1)[1]
+    return "hf", repo
+
+
+def ms_paths_info(repo, commit):
+    """`{path: {Path, Size, Sha256}}` for every file at `commit` (a branch name or a sha)."""
+    key = (repo, commit)
+    if key not in _ms_files:
+        url = "%s/api/v1/models/%s/repo/files?Revision=%s&Recursive=true" % (MS, repo, commit)
+        with urllib.request.urlopen(url) as r:
+            files = json.loads(r.read().decode("utf-8", "replace"))["Data"]["Files"]
+        _ms_files[key] = {f["Path"]: f for f in files}
+    return _ms_files[key]
+
+
+def upstream_source(repo, commit):
+    host, name = upstream_host(repo)
+    return "%s/%s@%s" % ("modelscope.cn" if host == "modelscope" else "huggingface.co", name, commit)
+
+
+def upstream_date(repo, commit):
+    """YYYY-MM-DD of the pinned upstream revision."""
+    host, name = upstream_host(repo)
+    if host == "modelscope":
+        if name not in _ms_dates:
+            with urllib.request.urlopen("%s/api/v1/models/%s" % (MS, name)) as r:
+                d = json.loads(r.read().decode("utf-8", "replace"))["Data"]
+            _ms_dates[name] = time.strftime("%Y-%m-%d", time.gmtime(d["LastUpdatedTime"]))
+        return _ms_dates[name]
+    return hf_commit_date(repo, commit)
 
 
 def hf_paths_info(repo, commit, paths):
@@ -102,6 +148,15 @@ def hf_commit_date(repo, commit):
 
 
 def upstream(media_type, repo, commit, path):
+    """A weights/tokenizer layer, fetched from the author's own host (Hugging Face or ModelScope)."""
+    host, name = upstream_host(repo)
+    if host == "modelscope":
+        f = ms_paths_info(name, commit).get(path)
+        if f is None:
+            raise SystemExit("%s@%s has no %s" % (repo, commit, path))
+        url = "%s/models/%s/resolve/%s/%s" % (MS, name, commit, path)
+        return {"mediaType": media_type, "digest": "sha256:" + f["Sha256"], "size": f["Size"],
+                "urls": [url]}
     url, size, oid = hf_file(repo, commit, path)
     return {"mediaType": media_type, "digest": "sha256:" + oid, "size": size, "urls": [url]}
 
@@ -171,18 +226,29 @@ def package_wl(spec, tag, v, blobs):
         oids[location] = oid
         weights.append(d)
         locals_.append(local)
+    # A variant's own weight file next to the upstream ones: a quantized bundle's int8 blob. It has
+    # no upstream source, so it is hosted like a graph and referenced by blob name, with the
+    # quantization named so the catalog can show what the file is.
+    for location, quantization in v.get("derived_weights", {}).items():
+        data = open(os.path.join(v["wl_dir"], location), "rb").read()
+        d = blobs.put(MEDIA["weights"], data, {"org.ollaya.quantization": quantization})
+        print("  %s:%s %s %.2f GB (%s)" % (spec["model"], tag, location, len(data) / 1e9, quantization))
+        oids[location] = d["digest"].split(":", 1)[1]
+        weights.append(d)
     if v.get("arch") and len(locals_) != 1:
         raise SystemExit("%s: the MLX engine reads one weights file" % spec["model"])
     arch = arch_layers(v, blobs, locals_[0]) if v.get("arch") else []
     data, stats = graph_from_wl(v["wl_dir"], oids)
-    print("  %s:%s fp32 graph %.1f MB %s" % (spec["model"], tag, len(data) / 2**20, stats))
-    graph = blobs.put(MEDIA["graph"], data, {"org.ollaya.precision": "fp32"})
+    precision = v.get("graph_precision", "fp32")
+    print("  %s:%s %s graph %.1f MB %s" % (spec["model"], tag, precision, len(data) / 2**20, stats))
+    graph = blobs.put(MEDIA["graph"], data, {"org.ollaya.precision": precision})
     # A vision model's image graph: a second graph layer, marked so the daemon passes it separately.
     vision = []
     if os.path.exists(os.path.join(v["wl_dir"], "vision.onnx")):
         data, stats = graph_from_wl(v["wl_dir"], oids, "vision.onnx")
         print("  %s:%s vision graph %.1f MB %s" % (spec["model"], tag, len(data) / 2**20, stats))
-        vision = [blobs.put(MEDIA["graph"], data, {"org.ollaya.precision": "fp32", "org.ollaya.graph": "vision"})]
+        vision = [blobs.put(MEDIA["graph"], data,
+                            {"org.ollaya.precision": precision, "org.ollaya.graph": "vision"})]
     # The tokenizer comes from the model's repo, or from another one (a base model's) as a triple.
     t = v["tokenizer"]
     tokenizer = upstream(MEDIA["tokenizer"], *(t if isinstance(t, tuple) else (repo, commit, t)))
@@ -199,8 +265,8 @@ def package_wl(spec, tag, v, blobs):
     config = blobs.put(MEDIA["config"], json.dumps({
         "model_format": "onnx", "family": spec["family"], "parameter_size": v["parameter_size"],
         "context_length": ctx, "languages": v["languages"], "description": v["description"],
-        "source": "huggingface.co/%s@%s" % (repo, commit), "license": license_id,
-        "release_date": hf_commit_date(repo, commit),
+        "source": upstream_source(repo, commit), "license": license_id,
+        "release_date": upstream_date(repo, commit),
     }, indent=2).encode())
     return config, [graph] + vision + weights + [tokenizer, decision, calibration] + questions + [lic] + arch
 

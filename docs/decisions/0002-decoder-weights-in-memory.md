@@ -114,7 +114,8 @@ with no spill and took 4.5 minutes. decider-2b's CUDA parity is unchanged with i
   any runtime, but changes the graph contract (hundreds of optional inputs) for what one session option does.
   Rejected.
 - **fp16 or bf16 compute.** Half the memory and faster, but it breaks the parity tolerance. Rejected by the parity
-  rule.
+  rule. (Revisited for one family, as a separate artifact with its own decision-level gate, in
+  [0005](0005-quantized-decoder-weights.md); the rule here still stands for the shipped fp32 families.)
 - **MLX on Apple silicon.** Reads BF16 directly, about 3x the ORT CPU speed for encoders; a separate engine,
   planned after v0.6.0. Complementary, not a replacement on Linux and
   Windows.

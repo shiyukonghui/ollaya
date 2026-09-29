@@ -58,7 +58,7 @@ def _gguf(export, repo, commit, gguf, description, params, languages, notice=Non
 
 
 def _wl(slug, repo, commit, description, params, ctx, languages, license=None, license_text=None, wl_dir=None,
-        weights=None, arch=None):
+        weights=None, arch=None, tokenizer="tokenizer.json"):
     """A model converted under `families/`, whose weightless graph (`out/<slug>-wl`) already
     references the upstream checkpoint by its file name.
 
@@ -72,7 +72,7 @@ def _wl(slug, repo, commit, description, params, ctx, languages, license=None, l
         "commit": commit,
         "wl_dir": wl_dir or os.path.join(OUT, slug + "-wl"),
         "weights": weights or {"model.safetensors": "model.safetensors"},  # graph location -> upstream file
-        "tokenizer": "tokenizer.json",
+        "tokenizer": tokenizer,
         "parameter_size": params,
         "context_length": ctx,
         "languages": languages,
@@ -96,6 +96,29 @@ def _kev_license(repo, base):
             "LoRA adapter and pointer head: Apache-2.0, per the model card.\n"
             "Base model: %s by the Qwen team (https://huggingface.co/Qwen/%s), Apache-2.0.\n"
             "Licensed under the Apache License, Version 2.0.\n\n" % (repo, base, base)) + LICENSE_APACHE
+
+
+# NeoHorse-Jev-4B is published on ModelScope, not Hugging Face: `package.upstream_host` reads the
+# prefix. The commit is the checkout's `HEAD`; the `SHA256SUMS` in the same commit is what the
+# ModelScope API serves for each file, which is the check `package_wl` makes.
+NEOHORSE_HOST = "modelscope:TokenRhythm/NeoHorse-Jev-4B"
+NEOHORSE_COMMIT = "21f09bf1f78e0f533e0cda4ebfb435c8313f2ce9"
+NEOHORSE_LICENSE = (
+    "NeoHorse-Jev-4B by TokenRhythm (https://www.modelscope.cn/models/TokenRhythm/NeoHorse-Jev-4B), "
+    "Apache-2.0 per its README. Backbone: Qwen3.5-4B by the Qwen team (Apache-2.0). The pointer head "
+    "and the runtime it was trained with are adapted from Kev by Jared Palmer (Apache-2.0).\n"
+    "Licensed under the Apache License, Version 2.0.\n\n") + LICENSE_APACHE
+
+
+def _neohorse_weights():
+    """Graph location -> upstream file: the three backbone shards and the pointer head. The vision
+    graph reads the third shard again."""
+    return {
+        "model-00001-of-00003.safetensors": "backbone/model-00001-of-00003.safetensors",
+        "model-00002-of-00003.safetensors": "backbone/model-00002-of-00003.safetensors",
+        "model-00003-of-00003.safetensors": "backbone/model-00003-of-00003.safetensors",
+        "pointer_head.safetensors": "pointer_head.safetensors",
+    }
 
 
 LICENSE_MIT_NLI = ("DeBERTa-v3-large zero-shot v2.0 by Moritz Laurer "
@@ -391,5 +414,38 @@ CATALOG = {
         "parity": "Ollaya's runner matches stock llama-server of the pinned build (b11146) on the same GGUF, "
                   "CUDA (RTX 4090): 593 questions, every decision the same, option logits within 7.7e-6 and "
                   "probabilities within 1.6e-6. The prompts are byte-identical to the author's jevk5.prompt.",
+    },
+    "neohorse": {
+        "namespace": "library",
+        "model": "neohorse",
+        "family": "neohorse",
+        "author": "TokenRhythm (bundle) and the Qwen team (Qwen3.5-4B backbone)",
+        "license": "Apache-2.0",
+        "license_text": NEOHORSE_LICENSE,
+        "tags": {
+            "4b": _wl("neohorse-4b", NEOHORSE_HOST, NEOHORSE_COMMIT,
+                      "Multimodal decision model (Qwen3.5-4B backbone plus an independent pointer head): a "
+                      "screenshot and a text state in, one score per option out, no text generation. Needs "
+                      "about 15 GB of memory.",
+                      "4.5B", 12288, ["en"], wl_dir=os.path.join(OUT, "neohorse"),
+                      weights=_neohorse_weights(), tokenizer="tokenizer/tokenizer.json"),
+            # The same bundle with the projections quantized to int8 and the GEMMs run in fp16
+            # (docs/decisions/0005-quantized-decoder-weights.md): about 5 GB of memory instead of 15,
+            # and 469 ms instead of 1033 ms for a 576-token decoder pass on an sm_75 card. The
+            # weights below the embedding are already int8, so the graph carries a 3.65 GB blob.
+            "4b-int8": dict(_wl("neohorse-4b-int8", NEOHORSE_HOST, NEOHORSE_COMMIT,
+                                "NeoHorse-Jev-4B with int8 projection weights and fp16 GEMMs: same decisions "
+                                "on the fixture set, about 5 GB of memory. See "
+                                "docs/decisions/0005-quantized-decoder-weights.md.",
+                                "4.5B", 12288, ["en"], wl_dir=os.path.join(OUT, "neohorse-q8f16"),
+                                weights=_neohorse_weights(), tokenizer="tokenizer/tokenizer.json"),
+                            graph_precision="int8",
+                            derived_weights={"model.q8.bin": "int8"}),
+        },
+        "aliases": {"latest": "4b"},
+        "parity": "The fp32 bundle reproduces the HF `Qwen3_5Model` + pointer head to 7.6e-6 on the demo "
+                  "request. The int8 tag is gated on decisions, not logits (its option scores drift up to "
+                  "6e-2, which no 2e-3 gate can hold at 8 bits): 19 of 19 realistic rows keep their argmax. "
+                  "See docs/decisions/0005-quantized-decoder-weights.md.",
     },
 }
