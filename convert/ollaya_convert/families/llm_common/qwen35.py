@@ -129,7 +129,10 @@ class Qwen35Trunk(nn.Module):
         z = mod.in_proj_z(h).reshape(B, T, -1, mod.head_v_dim)
         b = mod.in_proj_b(h)
         a = mod.in_proj_a(h)
-        q, k, v = torch.split(mixed, [mod.key_dim, mod.key_dim, mod.value_dim], dim=-1)
+        # Slices, not `torch.split`: `aten.split_with_sizes` lowers to `SplitToSequence` +
+        # `SequenceAt`, which ONNX Runtime runs on the CPU (one host round trip per layer) —
+        # measured at 14% of a NeoHorse decoder forward plus the 14% its copies back cost.
+        q, k, v = mixed[..., : mod.key_dim], mixed[..., mod.key_dim : 2 * mod.key_dim], mixed[..., 2 * mod.key_dim :]
         q = q.reshape(B, T, -1, mod.head_k_dim)
         k = k.reshape(B, T, -1, mod.head_k_dim)
         v = v.reshape(B, T, -1, mod.head_v_dim)
@@ -146,7 +149,9 @@ class Qwen35Trunk(nn.Module):
     def _attention(self, mod, h, cos, sin, bias):
         B, T, _ = h.shape
         hd = mod.head_dim
-        q, gate = torch.chunk(mod.q_proj(h).view(B, T, -1, hd * 2), 2, dim=-1)
+        # Slices for the same reason as `_deltanet`'s: `torch.chunk` becomes a sequence too.
+        qg = mod.q_proj(h).view(B, T, -1, hd * 2)
+        q, gate = qg[..., :hd], qg[..., hd:]
         gate = gate.reshape(B, T, -1)
         q = mod.q_norm(q).transpose(1, 2)
         k = mod.k_norm(mod.k_proj(h).view(B, T, -1, hd)).transpose(1, 2)
