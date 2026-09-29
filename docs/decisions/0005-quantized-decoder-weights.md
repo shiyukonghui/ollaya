@@ -102,11 +102,13 @@ boundary in fp16.**
 - **The gate is implemented, and it is the decisions.** `parity_neohorse` takes a goldens JSONL and a
   `--quantized` flag that switches the gate. Against `families/neohorse/goldens.py` (12 requests, 26
   questions, measured from the fp32 export, which is itself HF-gated at 7.6e-6): the fp32 bundle
-  reproduces the option logits to **5.2e-6**; the int8 bundle drifts up to **1.24e-1** and keeps
-  **every decision**. The engine's token rows (`ids` / `decide` / `opts`) are compared with the
-  reference's as well, so a different split cannot pass by scoring the wrong positions. The int8
-  number is a CPU measurement; on the GPU the provider propagates fp16 past the GEMM (see above), so
-  the logit bound carries headroom (`INT8_TOL = 3e-1`) and is a broken-artifact check, not the gate.
+  reproduces the option logits to **5.2e-6** on the CPU and **1.10e-5** on the GPU; the int8 bundle
+  drifts up to **1.24e-1** on both and keeps **every decision** on both. The engine's token rows
+  (`ids` / `decide` / `opts`) are compared with the reference's as well, so a different split cannot
+  pass by scoring the wrong positions. The device barely moves the int8 worst case — the error is the
+  8-bit weights, not the provider; the GPU's fp16 propagation perturbs an individual question by
+  ~1e-3 (see above) without changing the set's worst drift. The logit bound therefore carries
+  headroom (`INT8_TOL = 3e-1`) and is a broken-artifact check, not the gate.
 - **It is in the registry**: `library/neohorse:4b` and `library/neohorse:4b-int8` (plus the `latest`
   alias). NeoHorse is published on **ModelScope**, not Hugging Face, so `package.py` learned a second
   upstream host (a `modelscope:` prefix; the file list API supplies the sha256 and size the manifest
@@ -131,8 +133,10 @@ boundary in fp16.**
 - `library/neohorse:4b-int8` in `registry/v2/` — the manifest, its layers and their annotations.
 - Measured 2026-09-29 on choso (RTX 2080 Ti 22 GB, sm_75). The card was also serving other work
   (about 14.6 GiB held by other processes, 7.7 GiB free), so the fp32 baseline could not be
-  re-measured in the same session — the fp32 bundle needs about 14 GiB and spilled (19.3 s at 576
-  tokens, 41.5 s at 192). The two quantized variants need ~5 GiB and were measured back to back.
-  The 654 ms fp32 figure is from an earlier, clean session. The two quantized numbers and the
-  one-node benchmark were all taken under the same conditions as each other, and the one-node
-  benchmark uses no significant VRAM at all.
+  measured then — the fp32 bundle needs about 14 GiB and spilled (19.3 s at 576 tokens, 41.5 s at
+  192). The two quantized variants need ~5 GiB and were measured back to back; the 654 ms fp32
+  figure is from an earlier, clean session. A later pass with the card free (15.6 GiB) ran both
+  gates on the GPU: `out/parity_gpu_fp32.log` (fp32, load 12.8 s, warm median 270.1 ms, worst
+  1.097e-5) and `out/parity_gpu_int8.log` (int8, load 6.3 s, warm median 145.6 ms, worst 1.239e-1);
+  both keep all 26 decisions, and the same int8 bundle on the CPU (`out/parity_cpu_int8.log`) gives
+  1.245e-1, so the device is not what sets the drift.

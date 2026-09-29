@@ -313,9 +313,13 @@ fn main() -> anyhow::Result<()> {
     let (diff, argmax) = compare(got, &GOLDEN);
     println!("got    {got:?}");
     println!("golden {GOLDEN:?}");
-    println!(
-        "max|diff| = {diff:.3e} (tol {TOL:.1e}, gpu tol {GPU_TOL:.1e}), argmax = {argmax}"
-    );
+    match gate {
+        // The fp32 gate is `TOL` everywhere; `GPU_TOL` is what the CUDA provider actually holds.
+        Gate::Fp32 => println!(
+            "max|diff| = {diff:.3e} (tol {TOL:.1e}, gpu tol {GPU_TOL:.1e}), argmax = {argmax}"
+        ),
+        Gate::Int8 => println!("max|diff| = {diff:.3e} (bound {INT8_TOL:.1e}), argmax = {argmax}"),
+    }
     println!(
         "forward: first {cold_ms:.1} ms, warm min/median {:.1}/{:.1} ms over {} runs",
         warm_ms[0],
