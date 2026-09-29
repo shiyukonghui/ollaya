@@ -12,6 +12,7 @@
 //! in one request against `ref.reference_scores` (the HF backbone, no image).
 
 use std::path::Path;
+use std::time::Instant;
 
 use ollaya_runner::Engine;
 use ollaya_runner::neohorse::NeohorseModel;
@@ -28,7 +29,61 @@ const TEXT_GOLDEN: [&[f32]; 3] = [
     &[0.115011, 1.641563, -0.730399],
 ];
 const TOL: f32 = 2e-3;
+/// The looser tolerance a GPU is allowed: reductions and matmuls reorder on the CUDA provider,
+/// so scores move by ~1e-4 (ADR 0004's measured GPU parity) rather than the CPU's ~1e-6.
+const GPU_TOL: f32 = 5e-4;
 const STATE: &str = "A 256x240 image.";
+
+/// The device this run uses: `PARITY_DEVICE=cpu` (the default) or `PARITY_DEVICE=cuda[:<n>]`.
+fn device() -> Device {
+    match std::env::var("PARITY_DEVICE").as_deref() {
+        Ok(s) if s == "cuda" || s.starts_with("cuda:") => {
+            let id = s
+                .strip_prefix("cuda:")
+                .and_then(|n| n.parse::<i32>().ok())
+                .unwrap_or(0);
+            Device::Cuda(id)
+        }
+        _ => Device::Cpu,
+    }
+}
+
+/// The execution providers the *loaded* ONNX Runtime offers, as `ort` reports them through ONNX
+/// Runtime's own `GetAvailableProviders`. This is the load-dynamic build's actual provider set,
+/// not this crate's feature flags: with the GPU pack it must contain `CUDAExecutionProvider`.
+///
+/// `ort` rc.13 has no `session.providers()`, and with `load-dynamic` there is no import library to
+/// call `OrtGetApiBase` from, so this asks the providers `ort` itself knows about.
+#[cfg(feature = "cuda")]
+fn provider_names() -> Vec<String> {
+    use ort::ep::ExecutionProvider;
+    let mut out = Vec::new();
+    let cuda = ort::ep::CUDA::default();
+    if cuda.is_available().unwrap_or(false) {
+        out.push(cuda.name().to_string());
+    }
+    let tensorrt = ort::ep::TensorRT::default();
+    if tensorrt.is_available().unwrap_or(false) {
+        out.push(tensorrt.name().to_string());
+    }
+    let cpu = ort::ep::CPU::default();
+    if cpu.is_available().unwrap_or(false) {
+        out.push(cpu.name().to_string());
+    }
+    out
+}
+
+/// The providers the statically linked CPU build offers through `ort`.
+#[cfg(not(feature = "cuda"))]
+fn provider_names() -> Vec<String> {
+    use ort::ep::ExecutionProvider;
+    let cpu = ort::ep::CPU::default();
+    if cpu.is_available().unwrap_or(false) {
+        vec![cpu.name().to_string()]
+    } else {
+        Vec::new()
+    }
+}
 
 /// The largest absolute difference between `got` and `want`, and `got`'s argmax.
 fn compare(got: &[f32], want: &[f32]) -> (f32, usize) {
@@ -48,7 +103,19 @@ fn compare(got: &[f32], want: &[f32]) -> (f32, usize) {
 
 fn main() -> anyhow::Result<()> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../out/neohorse");
-    let model = NeohorseModel::load(&dir, Device::Cpu, None)?;
+    let device = device();
+    let providers = provider_names();
+    println!("device = {device:?}, available providers = {providers:?}");
+    if device != Device::Cpu {
+        anyhow::ensure!(
+            providers.iter().any(|p| p == "CUDAExecutionProvider"),
+            "PARITY_DEVICE={device:?} but the loaded ONNX Runtime has no CUDAExecutionProvider \
+             (providers: {providers:?}); the GPU pack is not on ORT_DYLIB_PATH/PATH"
+        );
+    }
+    let load_start = Instant::now();
+    let model = NeohorseModel::load(&dir, device, None)?;
+    println!("load    {:.3} s", load_start.elapsed().as_secs_f64());
     let png = std::fs::read(dir.join("demo.png"))?;
     let state = json!(STATE);
     let questions = json!({
@@ -88,14 +155,33 @@ fn main() -> anyhow::Result<()> {
         row.positions[0][row.decide]
     );
 
-    // The real request, through the engine API.
+    // The real request, through the engine API. The first forward pays one-off GPU costs
+    // (CUDA/cuDNN handles, kernel selection, arena growth), so it is timed on its own and then
+    // four more runs give a warm per-forward number.
+    let run_start = Instant::now();
     let out = model.run_images(&state, &questions, std::slice::from_ref(&png))?;
+    let cold_ms = run_start.elapsed().as_secs_f64() * 1e3;
+    let mut warm_ms = Vec::new();
+    for _ in 0..4 {
+        let t = Instant::now();
+        model.run_images(&state, &questions, std::slice::from_ref(&png))?;
+        warm_ms.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    warm_ms.sort_by(f64::total_cmp);
     let got = &out.questions[0].logits;
     anyhow::ensure!(got.len() == GOLDEN.len(), "got {} scores", got.len());
     let (diff, argmax) = compare(got, &GOLDEN);
     println!("got    {got:?}");
     println!("golden {GOLDEN:?}");
-    println!("max|diff| = {diff:.3e} (tol {TOL:.1e}), argmax = {argmax}");
+    println!(
+        "max|diff| = {diff:.3e} (tol {TOL:.1e}, gpu tol {GPU_TOL:.1e}), argmax = {argmax}"
+    );
+    println!(
+        "forward: first {cold_ms:.1} ms, warm min/median {:.1}/{:.1} ms over {} runs",
+        warm_ms[0],
+        warm_ms[warm_ms.len() / 2],
+        warm_ms.len() + 1
+    );
     anyhow::ensure!(diff <= TOL, "max|diff| = {diff:.3e} > {TOL:.1e}");
     anyhow::ensure!(argmax == 0, "argmax = {argmax}, expected red (0)");
     println!(

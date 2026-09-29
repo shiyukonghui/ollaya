@@ -24,10 +24,17 @@ __all__ = ["VisionGraph", "PointerDecoderGraph"]
 class PointerDecoderGraph(nn.Module):
     """input_ids [R, T] (T a multiple of 64, right-padded), position_ids [3, R, T],
     image_embeds [M, H] written at flat positions image_pos [M] (row * T + column),
-    decide_pos [R], opt_pos [R, K] -> raw pointer scores [R, K].
+    decide_idx / opt_idx [N] -> raw pointer scores [N].
 
-    `scores[r, :k_r]` are question r's option logits (the head's own temperature is applied by the
-    runtime, exactly as for `kev-pointer-v1`)."""
+    The readout takes **flat** indices, exactly like `image_pos`: entry n is row `n // K`'s decide
+    token (`decide_idx`) and its option `n % K` (`opt_idx`), so `scores[n]` is that option's logit
+    and the caller reshapes the `N = R * K` values back to rows. A 2-D advanced index
+    (`h[rows[:, None], opt_pos]`) instead makes `torch.export` fold shape arithmetic it cannot keep
+    symbolic — it derives the trunk's chunk reshape from the index's shape and emits a constant
+    `floordiv` that is 0 for `R > 1` (see `export.py`).
+
+    `scores[r * K : r * K + k_r]` are question r's option logits (the head's own temperature is
+    applied by the runtime, exactly as for `kev-pointer-v1`)."""
 
     def __init__(self, text_model, head, mrope_section):
         super().__init__()
@@ -35,14 +42,12 @@ class PointerDecoderGraph(nn.Module):
         self.head = head
         self.scale = float(head.scale)
 
-    def forward(self, input_ids, position_ids, image_embeds, image_pos, decide_pos, opt_pos):
+    def forward(self, input_ids, position_ids, image_embeds, image_pos, decide_idx, opt_idx):
         R, T = input_ids.shape
         x = self.trunk.m.embed_tokens(input_ids)
         flat = x.reshape(R * T, x.shape[-1]).index_copy(0, image_pos, image_embeds.to(x.dtype))
         h = self.trunk.embeds(flat.reshape(R, T, -1), position_ids)
-        rows = torch.arange(R, device=h.device)
-        hd = h[rows, decide_pos]                      # [R, H]
-        ho = h[rows.unsqueeze(1), opt_pos]            # [R, K, H]
-        q = self.head.q(hd)                           # [R, P]
-        k = self.head.k(ho)                           # [R, K, P]
-        return (k @ q.unsqueeze(-1)).squeeze(-1) * self.scale
+        hf = h.reshape(R * T, -1)
+        q = self.head.q(hf.index_select(0, decide_idx))   # [N, P]
+        k = self.head.k(hf.index_select(0, opt_idx))      # [N, P]
+        return (k * q).sum(-1) * self.scale               # [N]

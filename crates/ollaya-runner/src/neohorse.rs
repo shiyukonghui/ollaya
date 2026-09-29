@@ -23,8 +23,9 @@
 //! * `vision.onnx`: `patches` [N, 1536], `pos_idx` / `pos_w` [N, 4], `rot_ids` [N, 2] ->
 //!   `image_embeds` [N / 4, 2560] (see [`crate::vision`] for the inputs);
 //! * `model.onnx`: `input_ids` [R, T] (T a multiple of `chunk`), `position_ids` [3, R, T],
-//!   `image_embeds` [M, 2560] placed at the flat indices `image_pos` [M] (r * T + t),
-//!   `decide_pos` [R], `opt_pos` [R, K] -> `scores` [R, K].
+//!   `image_embeds` [M, 2560] placed at the flat indices `image_pos` [M] (r * T + t), and the two
+//!   readout indices `decide_idx` / `opt_idx` [N] (flat too: entry n is row n / K's decide token and
+//!   its option n % K) -> `scores` [N], row-major over (row, option).
 //!
 //! # Splicing and M-RoPE, which differ from `decider-vision-v1`
 //!
@@ -55,16 +56,11 @@
 //! after every row's tokens, which no slot can attend to (the model is causal). Upstream's visual
 //! adapter serves one question per request and repeats the image over rows; this engine keeps that
 //! rule and rejects more than one question when an image is attached.
-//!
-//! Every decoder run carries a single row whether or not there is an image, because the exported
-//! graph only folds its symbolic shapes correctly for one (see [`NeohorseModel::scores`], which
-//! also explains the failure mode). A text-only request of several questions is therefore several
-//! decoder runs.
 
 use std::path::Path;
 use std::sync::Mutex;
 
-use ndarray::{Array1, Array2, Array3, Ix2};
+use ndarray::{Array1, Array2, Array3, Ix1, Ix2};
 use ollaya_decision::kev::{KevLayout, KevRow, KevState};
 use ollaya_decision::{Calibration, CalibrationFile, Questions, TokenEncoder};
 use ort::session::Session;
@@ -78,11 +74,10 @@ use crate::onnx::{CudaArena, Device, ModelFiles, load_tokenizer, session_for};
 use crate::vision::{self, ImageConfig, Patches, Rgb};
 use crate::{Error, Output, QuestionOutput};
 
-/// Rows per decoder run. The graph's row axis is 1..=1024, but every run carries exactly one row:
-/// see [`NeohorseModel::scores`].
-const MAX_ROWS: usize = 1;
 /// Padded tokens per decoder run, as for the text decoders.
 const TOKEN_BUDGET: usize = 8192;
+/// Rows per decoder run.
+const MAX_ROWS: usize = 1024;
 /// Visual tokens per image, and patches (4 each, one `merge_size^2` block).
 const MAX_IMAGE_TOKENS: usize = 1024;
 const MAX_PATCHES: usize = 4 * MAX_IMAGE_TOKENS;
@@ -95,8 +90,8 @@ const INPUTS: [&str; 6] = [
     "position_ids",
     "image_embeds",
     "image_pos",
-    "decide_pos",
-    "opt_pos",
+    "decide_idx",
+    "opt_idx",
 ];
 const OUTPUT: &str = "scores";
 
@@ -443,22 +438,14 @@ impl NeohorseModel {
         Ok(out.iter().copied().collect())
     }
 
-    /// Each row's option scores (its first `k_row` graph outputs), rows shortest first.
+    /// Each row's option scores (the first `k_row` entries of the graph's flat output), rows
+    /// shortest first.
     ///
-    /// One row per `session.run`, unlike [`crate::decider_vision`]'s batching. The export folded a
-    /// symbolic-shape identity into real integer arithmetic (`floordiv_4` in `model.onnx`):
-    ///
-    /// ```text
-    /// f = (2 * (16 / R) * T * (2048 / (16 / R))) / (262144 * R)     // integer division
-    /// total = (T / f) * f
-    /// ```
-    ///
-    /// where `R` is the row count and `T` the padded width. `total` is meant to be `T`, and it is
-    /// exactly `T` when `f` divides `T` — true for `R = 1`, where `f = T / 64`. For `R > 1`, `f`
-    /// collapses (e.g. `R = 2, T = 64` gives `f = 0`): ONNX Runtime then fails with "Integer division
-    /// by zero", and a wider `T` only avoids the crash, since `total` is a wrong length unless `f`
-    /// happens to divide `T`. `parity.py` and upstream's visual adapter always send one row, which
-    /// is why this never showed. Text-only requests therefore run one row per session call too.
+    /// The readout indices are flat and row-major, exactly like `image_pos`: entry `r * k + j` is
+    /// row `r`'s decide token and its option `j`. A 2-D `opt_pos [R, K]` would be more direct, but
+    /// `torch.export` cannot keep its shape symbolic — it derives the trunk's chunk reshape from
+    /// the index's shape and folds a constant `floordiv` that is 0 for `R > 1`, so ONNX Runtime
+    /// fails with "Integer division by zero". See `convert/.../neohorse/graphs.py`.
     pub fn scores(&self, encoding: &NeohorseEncoding) -> Result<Vec<Vec<f32>>, Error> {
         let rows = &encoding.rows;
         let embeds = encoding
@@ -484,8 +471,8 @@ impl NeohorseModel {
             let k = batch.iter().map(|&i| rows[i].opts.len()).max().unwrap_or(0);
             let mut input_ids = Array2::<i64>::from_elem((n, seq), pad);
             let mut position_ids = Array3::<i64>::zeros((3, n, seq));
-            let mut decide_pos = Array1::<i64>::zeros(n);
-            let mut opt_pos = Array2::<i64>::zeros((n, k));
+            let mut decide_idx = Array1::<i64>::zeros(n * k);
+            let mut opt_idx = Array1::<i64>::zeros(n * k);
             for (r, &i) in batch.iter().enumerate() {
                 let row = &rows[i];
                 for (c, &id) in row.ids.iter().enumerate() {
@@ -496,9 +483,11 @@ impl NeohorseModel {
                         position_ids[[a, r, c]] = p;
                     }
                 }
-                decide_pos[r] = row.decide as i64;
+                // Flat, one entry per (row, option): the row's decide token and that option's close.
+                let decide = r * seq + row.decide;
                 for (c, &p) in row.opts.iter().enumerate() {
-                    opt_pos[[r, c]] = p as i64;
+                    decide_idx[r * k + c] = decide as i64;
+                    opt_idx[r * k + c] = (r * seq + p) as i64;
                 }
             }
             let (image_embeds, image_pos) = match &embeds {
@@ -527,21 +516,22 @@ impl NeohorseModel {
                 "position_ids" => ort::value::Tensor::from_array(position_ids)?,
                 "image_embeds" => ort::value::Tensor::from_array(image_embeds)?,
                 "image_pos" => ort::value::Tensor::from_array(image_pos)?,
-                "decide_pos" => ort::value::Tensor::from_array(decide_pos)?,
-                "opt_pos" => ort::value::Tensor::from_array(opt_pos)?,
+                "decide_idx" => ort::value::Tensor::from_array(decide_idx)?,
+                "opt_idx" => ort::value::Tensor::from_array(opt_idx)?,
             ])?;
             let out = outputs[OUTPUT]
                 .try_extract_array::<f32>()?
-                .into_dimensionality::<Ix2>()
+                .into_dimensionality::<Ix1>()
                 .map_err(|e| Error::Model(format!("{OUTPUT}: {e}")))?;
-            if out.nrows() != n || out.ncols() != k {
+            if out.len() != n * k {
                 return Err(Error::Model(format!(
                     "{OUTPUT} has shape {:?} for {n} rows of up to {k} options",
                     out.shape()
                 )));
             }
-            for (&i, row) in batch.iter().zip(out.rows()) {
-                scores[i] = row.iter().take(rows[i].opts.len()).copied().collect();
+            let out = out.as_slice().expect("the output is contiguous");
+            for (r, &i) in batch.iter().enumerate() {
+                scores[i] = out[r * k..r * k + rows[i].opts.len()].to_vec();
             }
         }
         Ok(scores)

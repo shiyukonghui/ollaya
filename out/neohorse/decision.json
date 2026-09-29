@@ -78,9 +78,10 @@
     10
   ],
   "option_logits": {
-    "choice": "scores[row, :k]",
-    "noul": "scores[row, :2] (0 = no = false, 1 = yes = true)",
-    "score": "scores[row, :levels]"
+    "shape": "scores is flat, one entry per (row, option) row-major, so row r owns scores[r * K : r * K + k_r]",
+    "choice": "row r's first k",
+    "noul": "row r's first 2 (0 = no = false, 1 = yes = true)",
+    "score": "row r's first `levels`"
   },
   "opset": 20,
   "precision": "fp32 compute; base weights BF16, widened by Cast; head F32",

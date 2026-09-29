@@ -76,18 +76,19 @@ def main():
                         "rot_ids": rot_ids.numpy().astype(np.int64)})[0]
     print("vision.onnx -> image_embeds", emb.shape)
     ds = session(str(md / "model.onnx"))
+    # N = R * K flat readout indices, row-major: row n // K's decide token, that row's option n % K.
     got = ds.run(None, {
         "input_ids": ids2.numpy().astype(np.int64),
         "position_ids": pos.numpy().astype(np.int64),
         "image_embeds": emb.astype(np.float32),
         "image_pos": image_pos,
-        "decide_pos": np.array([row["decide"]], dtype=np.int64),
-        "opt_pos": np.array([row["opts"]], dtype=np.int64),
+        "decide_idx": np.full(len(row["opts"]), row["decide"], dtype=np.int64),
+        "opt_idx": np.array(row["opts"], dtype=np.int64),
     })[0]
 
     k = len(row["opts"])
     w = np.asarray(want[0], dtype=np.float32)[:k]
-    g = np.asarray(got[0], dtype=np.float32)[:k]
+    g = np.asarray(got, dtype=np.float32)[:k]
     diff = float(np.abs(w - g).max())
     print("HF   ", np.round(w, 4).tolist())
     print("ONNX ", np.round(g, 4).tolist())

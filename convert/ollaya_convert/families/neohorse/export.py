@@ -6,7 +6,8 @@
 Graphs (layout `neohorse-pointer-vision-v1`, see graphs.py, ref.py and layout.py):
     vision.onnx   patches [N, 1536], pos_idx [N, 4], pos_w [N, 4], rot_ids [N, 2] -> image_embeds [N/4, 2560]
     model.onnx    input_ids [R, T], position_ids [3, R, T], image_embeds [M, 2560], image_pos [M],
-                  decide_pos [R], opt_pos [R, K] -> scores [R, K]
+                  decide_idx [N], opt_idx [N] -> scores [N] (row-major over (row, option);
+                  entry n belongs to row n // K, so the caller reshapes N = R * K)
 Both reference the bundle's own files by byte offset: the three backbone shards (BF16), the pointer
 head (`pointer_head.safetensors`, F32). Nothing is copied.
 
@@ -31,7 +32,7 @@ from .layout import NeohorseLayout
 
 VISION_INPUTS = ["patches", "pos_idx", "pos_w", "rot_ids"]
 VISION_OUTPUTS = ["image_embeds"]
-INPUTS = ["input_ids", "position_ids", "image_embeds", "image_pos", "decide_pos", "opt_pos"]
+INPUTS = ["input_ids", "position_ids", "image_embeds", "image_pos", "decide_idx", "opt_idx"]
 OUTPUTS = ["scores"]
 
 MAX_IMAGE_TOKENS = ref.MAX_IMAGE_TOKENS
@@ -84,27 +85,37 @@ def export(out_dir, root):
 
     rows, _ = layout.encode("A 256x240 image.", qs, image_tokens=n_img)
     row = rows[0]
-    ids = torch.tensor([row["ids"]], dtype=torch.long)
+    k = len(row["opts"])
+    # Two identical rows, not one: with a single-row example `torch.export` resolves the trunk's
+    # head-count reshapes against the (dynamic) row axis and emits `16 // rows` / `32 // rows`
+    # instead of the constants 16 / 32, so `model.onnx` runs at R = 1 and fails at R > 1. A
+    # two-row example keeps them static (the same recipe as `decider_vision/export.py`).
+    R = 2
+    ids = torch.tensor([row["ids"]] * R, dtype=torch.long)
     T = -(-ids.shape[1] // CHUNK) * CHUNK
     # one slack column per row: text-only requests park a zero image slot in the padding
     if T == ids.shape[1]:
         T += CHUNK
-    R = ids.shape[0]
     ids2 = torch.zeros((R, T), dtype=torch.long)
     ids2[:, : ids.shape[1]] = ids
     mm = (ids2 == cfg.image_token_id).long()
-    pos, _ = backbone.get_rope_index(ids2, mm, image_grid_thw=grid,
+    grid2 = grid.repeat(R, 1)  # `get_rope_index` consumes one grid per image in the batch
+    pos, _ = backbone.get_rope_index(ids2, mm, image_grid_thw=grid2,
                                      attention_mask=torch.ones_like(ids2))
     where = (ids2 == cfg.image_token_id).nonzero()
     image_pos = where[:, 0] * T + where[:, 1]
+    emb2 = torch.cat([emb] * R)  # the same image on every row
 
     dg = PointerDecoderGraph(backbone.language_model, head, cfg.text_config.rope_parameters["mrope_section"]).eval()
-    args = (ids2, pos, emb.to(torch.float32), image_pos, torch.tensor([row["decide"]]),
-            torch.tensor([row["opts"]]))
+    # N = R * K flat readout indices, row-major: the decide token of row n // K, that row's option
+    # n % K.
+    decide_idx = torch.tensor([r * T + row["decide"] for r in range(R) for _ in range(k)], dtype=torch.long)
+    opt_idx = torch.tensor([r * T + p for r in range(R) for p in row["opts"]], dtype=torch.long)
+    args = (ids2, pos, emb2.to(torch.float32), image_pos, decide_idx, opt_idx)
     with torch.no_grad():
         got = dg(*args)
         want, _, _, _ = ref.reference_scores(tok, backbone, head, layout, "A 256x240 image.", qs, image, proc)
-    diff = float((got[0, : len(row["opts"])] - torch.tensor(want[0])).abs().max())
+    diff = float((got.reshape(R, k) - torch.tensor(want[0])).abs().max())
     print("eager graph vs HF backbone: %.2e" % diff)
 
     tmp = ox.scratch_dir("neohorse-export-")
@@ -116,11 +127,12 @@ def export(out_dir, root):
     Rd = torch.export.Dim("rows", min=1, max=1024)
     Nc = torch.export.Dim("chunks", min=1, max=256)
     M = torch.export.Dim("image_tokens", min=1, max=65536)
-    K = torch.export.Dim("options", min=1, max=MAX_OPTIONS)
+    # `decide_idx` and `opt_idx` share this: both are one entry per (row, option), row-major.
+    N = torch.export.Dim("readout", min=1, max=1024 * MAX_OPTIONS)
     secs = ox.export_graph(dg, args, INPUTS, OUTPUTS,
                            {"input_ids": {0: Rd, 1: CHUNK * Nc}, "position_ids": {1: Rd, 2: CHUNK * Nc},
-                            "image_embeds": {0: M}, "image_pos": {0: M}, "decide_pos": {0: Rd},
-                            "opt_pos": {0: Rd, 1: K}}, os.path.join(tmp, "decoder", "model.onnx"))
+                            "image_embeds": {0: M}, "image_pos": {0: M}, "decide_idx": {0: N},
+                            "opt_idx": {0: N}}, os.path.join(tmp, "decoder", "model.onnx"))
     print("decoder exported in %.0fs" % secs)
 
     shards = _backbone_files(root)
@@ -170,8 +182,10 @@ def export(out_dir, root):
                   "image_std": list(ip.image_std), "position_table_side": vis.num_grid_per_side,
                   "position_interpolation": "bilinear, align_corners", "max_image_tokens": MAX_IMAGE_TOKENS},
         "mrope_section": cfg.text_config.rope_parameters["mrope_section"],
-        "option_logits": {"choice": "scores[row, :k]", "noul": "scores[row, :2] (0 = no = false, 1 = yes = true)",
-                          "score": "scores[row, :levels]"},
+        "option_logits": {"shape": "scores is flat, one entry per (row, option) row-major, so row r "
+                                   "owns scores[r * K : r * K + k_r]",
+                          "choice": "row r's first k", "noul": "row r's first 2 (0 = no = false, 1 = yes = true)",
+                          "score": "row r's first `levels`"},
         "opset": ox.OPSET,
         "precision": "fp32 compute; base weights BF16, widened by Cast; head F32",
         "weights_in_memory": ox.weights_in_memory(rep_d),
